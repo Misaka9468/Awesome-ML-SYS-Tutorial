@@ -489,6 +489,62 @@ class PrefillAdder:
 - **作用**: Future 机制中的索引信息
 - **用途**: 在重叠调度中**管理异步结果的存储和检索**
 
+
+[4 tools called]
+
+`GenerationBatchResult` 在 SGLang Scheduler 中扮演着 **“GPU 算力结果的搬运工”** 的角色。
+
+简单来说，如果把 `ScheduleBatch` 比作 Scheduler 发出的“施工指令”，那么 `GenerationBatchResult` 就是 GPU 完成施工后返回的“验收报告”。
+
+它是连接 **GPU 计算流水线** 和 **CPU 调度逻辑** 的核心桥梁，其在系统中的位置和作用可以从以下几个维度理解：
+
+### 1. 它是如何产生的？（生命周期起点）
+在 `TpModelWorker::forward_batch_generation` 中，当 GPU 完成推理（Forward）并进行采样（Sample）后，它会将所有的输出打包进 `GenerationBatchResult` 对象中并返回给 Scheduler。
+
+```python
+# TpModelWorker.py 示意代码
+def forward_batch_generation(self, model_worker_batch):
+    # 1. 运行模型前向
+    logits_output = self.model_runner.forward(forward_batch)
+    # 2. 采样得到 token
+    next_token_ids = self.model_runner.sample(logits_output, forward_batch)
+    
+    # 3. 将所有结果打包返回
+    return GenerationBatchResult(
+        logits_output=logits_output,
+        next_token_ids=next_token_ids,
+        ...
+    )
+```
+
+### 2. 它是如何被消耗的？（Scheduler 的处理逻辑）
+Scheduler 在主循环中拿到这个 `result` 后，会根据它携带的信息来更新每个 Request 的状态。这主要发生在 `process_batch_result` 函数中：
+
+*   **更新 Token**: 将 `next_token_ids` 中的值追加到各个请求的 `output_ids` 中。
+*   **判断结束**: 检查新生成的 token 是否是停止符（EOS），如果是，则将该请求从 `running_batch` 移除。
+*   **流式输出**: 根据 `logits_output` 里的 logprob 信息，将结果推送到前端。
+*   **释放资源**: 如果请求完成，通知 Radix Cache 释放或缓存对应的 KV Cache。
+
+### 3. 它与 Overlap（重叠调度）的关系（核心纽带）
+在 **Zero-Overhead Scheduler** 模式下，`GenerationBatchResult` 的作用发生了质变，它是实现异步非阻塞调度的关键：
+
+*   **延迟采样 (`delay_sample_func`)**: 在重叠模式下，GPU 前向计算完成后，并不会立即阻塞等待采样结果，而是先返回一个包含“采样函数”的 `result`。Scheduler 可以利用 GPU 采样的空档去处理上一个 batch 的后处理。
+*   **同步令牌 (`copy_done`)**: 它携带了一个 CUDA Event。Scheduler 在真正需要访问 CPU 侧的 token ID 时（比如要把 token 发给用户），会调用 `result.copy_done.synchronize()`。这确保了 CPU 不会读到还没传输完成的脏数据。
+*   **占位符管理 (`future_indices`)**: 在重叠模式中，当前的输出是下一个 batch 的输入。`GenerationBatchResult` 记录了这些 token 在 GPU `FutureMap` 中的位置索引，让下一个 batch 的计算能直接从 GPU 显存中“取走”结果，而不需要经过 CPU 绕路。
+
+### 4. 总结：数据结构间的演进关系
+
+| 结构名称 | 所在位置 | 核心使命 |
+| :--- | :--- | :--- |
+| **`Req`** | CPU (Waiting Queue) | 单个请求的元数据（Prompt, Sampling Params） |
+| **`ScheduleBatch`** | CPU (Scheduler) | 这一轮要跑哪些请求？KV Cache 分配在哪？ |
+| **`ModelWorkerBatch`**| CPU/GPU 边界 | 准备好 Tensor 化的输入，发往 Worker |
+| **`ForwardBatch`** | GPU (ModelRunner) | 底层算子直接使用的 Tensor 数据（Pos, Mask, KV Pool） |
+| **`GenerationBatchResult`** | **GPU -> CPU** | **模型吐出的原始数据：算出了什么 Token？Logits 是多少？** |
+
+**一句话总结**：
+`GenerationBatchResult` 是 **“计算结果的封装”**。它让 Scheduler 能够以统一的接口处理无论是 Prefill、Decode 还是推测解码（Speculative Decoding）产生的各种复杂 GPU 返回值，并支持了 CPU 和 GPU 的异步重叠运行。
+
 ## Normal (No overlap)
 
 LLM 是自回归结构，所以无论是 Prefill 还是 Decode，驱动它们进行下一步推理的都是预测序列的下一个 token，包含 `next_token_ids` 的数据就非常关键
@@ -739,6 +795,292 @@ def event_loop_normal(self):
    ├── stream_output()
    └── free KV pages
 ```
+
+
+## 重写 normal
+
+# SGLang Scheduler：正常模式技术解析（Markdown表格重构版）
+
+## 第一部分：核心概念与总览
+
+### 1.1 自回归驱动的核心：`next_token_ids`
+
+| 对比维度 | Prefill 模式 | Decode 模式 |
+|:---|:---|:---|
+| **形状** | `[batch_size]` - 每个请求一个 token ID | `[batch_size]` - 每个请求一个 token ID |
+| **内容** | 基于输入序列最后一个位置的 logits 采样得到的下一个 token | 当前解码步骤生成的下一个 token |
+| **采样位置** | 使用序列的最后一个位置：`seq_lens - 1` | 使用当前解码位置：`forward_batch.positions` |
+
+### 1.2 全流程阶段概览
+
+**请求处理流程**：
+```
+Req → Pre Schedule(CPU) → Compute Batch → Sample(GPU) → Post Schedule(CPU) → next Schedule ...
+```
+
+**事件循环核心逻辑**：
+```python
+def event_loop_normal(self):
+    """A normal scheduler loop."""
+    while True:
+        # 1. 接收请求并处理入队
+        recv_reqs = self.recv_requests()
+        self.process_input_requests(recv_reqs)
+        
+        # 2. 获取本轮执行批次 (Prefill 优先)
+        batch = self.get_next_batch_to_run()
+        self.cur_batch = batch
+        
+        if batch:
+            # 3. 运行推理与采样
+            result = self.run_batch(batch)
+            # 4. 执行后处理（更新状态、流式输出、释放缓存）
+            self.process_batch_result(batch, result)
+        else:
+            # 空闲时执行自检与重置
+            self.self_check_during_idle()
+            
+        self.last_batch = batch
+```
+
+---
+
+## 第二部分：分阶段深度对比
+
+### 2.1 阶段一：Pre Schedule（请求接入与调度决策）
+
+#### 2.1.1 请求进入等待队列 (Req → Waiting_queue)
+
+| 步骤 | 函数调用 | 具体操作 |
+|:---|:---|:---|
+| **接收请求** | `Schedule::recv_request()` | 1. Pipeline rank = 0 通过 zmq 从 tokenizer 获取 requests<br>2. 其他 pipeline rank 从前一个 pipeline 获取 requests<br>3. `work_reqs` 在 `attn_tp` 中广播<br>4. `control_reqs` 在整个 `tp_size` 中广播 |
+| **处理请求** | `Schedule::process_input_requests()` | 1. **提取 worker_id**: `worker_id = recv_req.worker_id`<br>2. **解包请求**: `recv_req = recv_req.obj`<br>3. **分发处理**: `output = self._request_dispatcher(recv_req)`<br>   - 将 recv_req 构建为新的 `Req` 对象<br>   - 调用 `_add_request_to_queue()` 将 `Req` 插入 `waiting_queue`<br>4. **发送回应**: 将输出发送回对应的 tokenizer 工作进程 |
+
+#### 2.1.2 调度决策 (Waiting_queue/running_batch → cur_batch)
+
+| 对比维度 | Prefill 批次构建 | Decode 批次构建 |
+|:---|:---|:---|
+| **调度函数** | `Schedule::get_new_batch_prefill()` | `Schedule::update_running_batch()` |
+| **调度策略** | **Prefill 优先策略**：直接返回 `new_batch` 作为 `cur_batch` | 处理上一批次的完成请求，然后与 `running_batch` 进行 merge |
+| **核心算法** | Radix Tree 和最长前缀匹配 (Longest Prefix Matching)<br>通过 `Req::init_next_round_input()` 实现 | 批次合并：将上一轮的 decode batch 与 `running_batch` 合并（`torch.cat` 拼接） |
+
+### 2.2 阶段二：调度构建与资源分配（Prefill vs Decode）
+
+#### 2.2.1 Prefill 调度构建详解
+
+| 组件 | 函数调用 | 具体实现 |
+|:---|:---|:---|
+| **PrefillAdder** | `get_new_batch_prefill()` | 管理批次构建，从 `waiting_queue` 中选择请求，支持分块处理 |
+| **前缀匹配** | `Req::init_next_round_input()` | 1. **构建完整填充序列**：原始输入 token + 已生成的输出 token<br>2. **最大前缀长度计算**：最多缓存到倒数第二个 token（`input_len - 1`）<br>3. **前缀匹配示例**：Request `ABC` 匹配缓存 `AFG`，拆分为 `A` 和 `FG` |
+| **资源分配** | `ScheduleBatch::prepare_for_extend()` | 1. 分配 `req_pool_indices`<br>2. 分配 KV Cache slots 数：`总输入数 - 前缀匹配数`<br>3. 写入 `req_to_token_pool` |
+
+**`req_to_token_pool` 映射结构**：
+
+| 内存区域 | 起始索引 | 结束索引 | 存储的映射值 |
+|:---|:---|:---|:---|
+| 前缀部分 (1984 tokens) | 0 | 1983 | [loc_1, loc_2, ..., loc_1984] |
+| 新chunk部分 (2000 tokens) | 1984 | 3983 | [loc_1985, loc_1986, ..., loc_3984] |
+
+**KV Cache Pool 布局**：
+
+| 位置索引 | 存储的KV对 | 位置索引 | 存储的KV对 |
+|:---|:---|:---|:---|
+| loc_1 | k1,v1 | loc_1984 | k1984,v1984 |
+| loc_2 | k2,v2 | loc_1985 | k1985,v1985 |
+| ... | ... | ... | ... |
+| loc_1983 | k1983,v1983 | loc_3984 | k3984,v3984 |
+
+#### 2.2.2 Decode 调度构建详解
+
+| 步骤 | 函数调用 | 具体实现 |
+|:---|:---|:---|
+| **批次合并** | `update_running_batch()` | 1. 删除已完成或出错的 batch<br>2. 将上一轮的 decode batch 与 running_batch 合并<br>3. 拼接 `seq_lens`, `orig_seq_lens`, `output_ids` 等 |
+| **回退机制** | `Schedule::retract_decode()` | 1. 检查是否需要回退请求<br>2. 把要回退的请求重新插入 `waiting_queue` |
+| **资源分配** | `ScheduleBatch::prepare_for_decode()` | 1. 输入转换：`output_ids` → `input_ids`<br>2. 分配单槽位：`out_cache_loc = alloc_token_slots(batch.tree_cache, bs * 1)`<br>3. 快速原地更新：`self.seq_lens.add_(1)`, `self.seq_lens_cpu.add_(1)`, `self.seq_lens_sum += bs` |
+
+**Decode 内存分配示例**：
+
+| 请求 | 当前长度 | 分配的缓存位置 | KV Cache 映射更新 |
+|:---|:---|:---|:---|
+| req1 | 10 | loc34 | `req_to_token_pool[req1_idx, 10] = loc34` |
+| req2 | 15 | loc35 | `req_to_token_pool[req2_idx, 15] = loc35` |
+| req3 | 8 | loc36 | `req_to_token_pool[req3_idx, 8] = loc36` |
+
+**分配结果**：`out_cache_loc = [loc34, loc35, loc36]`
+
+### 2.3 阶段三：Compute Batch & Sample（GPU侧执行）
+
+#### 2.3.1 批次转换与调度
+
+| 转换步骤 | 函数调用链 | 作用 |
+|:---|:---|:---|
+| **批次转换** | `ScheduleBatch` → `ModelWorkerBatch` → `ForwardBatch` | 将调度批次转换为模型计算批次 |
+| **调度调用** | `TpModelWorker::forward_batch_generation()` → `ModelRunner::forward()` → `ModelRunner::_forward_raw()` | 驱动模型前向计算 |
+
+#### 2.3.2 前向计算路径对比
+
+| 对比维度 | Prefill 路径 | Decode 路径 |
+|:---|:---|:---|
+| **执行函数** | `ModelRunner::forward_extend()` | `ModelRunner::forward_decode()` |
+| **后端算子** | 调用后端 flashinfer 的算子 | 调用后端 flashinfer 的算子 |
+
+#### 2.3.3 采样（Sample）过程详解
+
+**采样核心代码**：
+```python
+sampling_info.update_regex_vocab_mask()
+sampling_info.apply_logits_bias(logits_output.next_token_logits)
+next_token_ids = self.sampler(
+    logits_output,
+    forward_batch.sampling_info,
+    forward_batch.return_logprob,
+    forward_batch.top_logprobs_nums,
+    forward_batch.token_ids_logprobs,
+    # For prefill, we only use the position of the last token.
+    (
+        forward_batch.positions
+        if forward_batch.forward_mode.is_decode()
+        else forward_batch.seq_lens - 1
+    ),
+)
+```
+
+**采样逻辑对比**：
+
+| 对比维度 | Prefill 采样 | Decode 采样 |
+|:---|:---|:---|
+| **采样时机** | 立即进行 Sample（非 overlap 模式） | 立即进行 Sample（非 overlap 模式） |
+| **采样位置** | `forward_batch.seq_lens - 1` | `forward_batch.positions` |
+| **结果用途** | 得到 batch 的 `next_token_ids`，供下一次 batch forward 使用 | 得到 batch 的 `next_token_ids`，供下一次 batch forward 使用 |
+
+### 2.4 阶段四：Post Schedule（CPU侧后处理）
+
+#### 2.4.1 Prefill 结果处理
+
+| 步骤 | 函数调用 | 具体操作 |
+|:---|:---|:---|
+| **解包结果** | `process_batch_result_prefill()` | 解包 `GenerationBatchResult` |
+| **同步等待** | `copy_done.synchronize()` | 等待 GPU→CPU 拷贝完成 |
+| **遍历处理** | 遍历每个请求 | 1. 更新生成结果<br>2. 更新 logprob<br>3. **Chunked 请求特殊处理**：`is_chunked > 0` 时递减计数并跳过流式输出 |
+| **缓存保留** | `tree_cache.cache_unfinished_req(req)` | 保留该 req 的 cache |
+| **输出结果** | `stream_output()` | 将结果发送给客户端 |
+
+#### 2.4.2 Decode 结果处理
+
+**处理流程图**：
+
+| 步骤 | 操作 | 函数/说明 |
+|:---|:---|:---|
+| 1 | GPU forward kernel 完成 | 结果写入 `GenerationBatchResult` |
+| 2 | 同步数据 | `copy_done.synchronize()` |
+| 3 | 获取 token IDs | `next_token_ids.tolist()` |
+| 4 | 更新请求状态 | `req.output_ids.append(next_token_id)` |
+| 5 | 完成判断与释放 | 如果完成：`tree_cache.cache_finished_req(req)` 并批量释放 KV cache |
+| 6 | 结果输出 | `stream_out()` 返回给 detokenizer |
+
+**详细步骤**：
+
+| 操作 | 具体实现 |
+|:---|:---|
+| **同步数据** | 1. 同步 GPU 数据<br>2. 获取 `next_token_ids.tolist()` |
+| **更新状态** | `req.output_ids.append(next_token_id)` |
+| **完成判断** | 对每个 Req 进行判断，如果已经完成就释放 tree_cache 中对应的 KV cache（循环解释后批量释放） |
+| **结果输出** | 将 batch 的结果通过 `stream_out()` 返回给 detokenizer 进行下一步处理 |
+
+---
+
+## 第三部分：关键数据结构附录
+
+### 3.1 `GenerationBatchResult` 完整字段说明
+
+| 字段 | 数据类型 | 作用与用途 | 详细说明 |
+|:---|:---|:---|:---|
+| `logits_output` | `LogitsOutput` 结构体 | 包含模型输出的原始数据 | 1. `next_token_logits`: 用于采样的下一个 token 的 logits<br>2. `input_token_logprobs`: 输入 token 的对数概率<br>3. `hidden_states`: 隐藏状态（可选） |
+| `next_token_ids` | `torch.Tensor` | 采样后的 Token ID 序列 | **形状**: `[batch_size]`<br>**用途**: 更新请求的 `output_ids`，驱动下一步推理 |
+| `num_accepted_tokens` | `int` 或 `torch.Tensor` | 推测解码中被接受的 Token 数量 | 用于统计接受率以进行优化 |
+| `next_draft_input` | `torch.Tensor` | EAGLE 推测解码的下一轮输入 | 形状和内容取决于推测解码算法 |
+| `extend_input_len` | `torch.Tensor` | 每个请求的扩展输入长度 | **形状**: `[batch_size]`<br>**用途**: 获知每个请求实际处理了多少新 Token |
+| `copy_done` | `torch.cuda.Event` | GPU→CPU 数据传输完成的同步事件 | 确保重叠调度中数据可用性 |
+| `delay_sample_func` | `Callable` | 延迟采样函数 | 仅用于重叠调度模式 |
+| `future_indices` | `List[int]` 或 `torch.Tensor` | Future 机制中的索引信息 | 管理异步结果的存储与检索 |
+
+### 3.2 关键内存管理数据结构
+
+| 数据结构 | 类型 | 作用 | 关键操作 |
+|:---|:---|:---|:---|
+| `tree_cache` | `RadixCache` 实例 | 管理 KV Cache 的基数树缓存 | 1. `cache_unfinished_req()`: 保留未完成请求的缓存<br>2. `cache_finished_req()`: 释放已完成请求的缓存<br>3. `match_prefix()`: 前缀匹配 |
+| `req_to_token_pool` | `torch.Tensor` | 请求到 KV Cache 位置的映射表 | **形状**: `[max_req_num, max_seq_len]`<br>**内容**: 存储每个请求每个位置的 KV Cache 物理地址 |
+| `req_pool_indices` | `List[int]` | 请求在池中的索引 | 为每个请求分配的唯一索引 |
+
+---
+
+## 第四部分：完整流程总结
+
+### 4.1 请求完整生命周期
+
+| 阶段 | 函数调用链 | 说明 |
+|:---|:---|:---|
+| **请求进入** | `recv_requests()` → `process_input_requests()` → `waiting_queue` | 接收并排队新请求 |
+| **Prefill阶段** | `get_new_batch_prefill()` → `prepare_for_extend()` → `forward_extend()` → `sample()` → `process_batch_result_prefill()` | 处理新请求的初始计算 |
+| **Decode循环** | `update_running_batch()` → `prepare_for_decode()` → `forward_decode()` → `sample()` → `process_batch_result_decode()` | 循环生成后续 token |
+| **请求完成** | `tree_cache.cache_finished_req()` → 释放KV Cache → 从running_batch移除 | 清理完成请求的资源 |
+
+### 4.2 核心调度策略总结
+
+| 策略维度 | 具体实现 |
+|:---|:---|
+| **调度优先级** | **Prefill 优先策略**：优先调度新请求进行 Prefill |
+| **内存管理** | **Radix Tree 前缀匹配**：通过最长前缀匹配复用 KV Cache |
+| **批次合并** | **动态批次合并**：将新请求与运行中的请求动态合并 |
+| **回退机制** | **内存不足回退**：将部分 Decode 请求回退到等待队列 |
+| **分块处理** | **大请求分块**：对过长的 Prefill 请求进行分块处理 |
+
+---
+
+## 第五部分：技术细节备忘
+
+### 5.1 关键数值与约束
+
+| 参数 | 典型值/约束 | 说明 |
+|:---|:---|:---|
+| `batch_size` | 动态变化 | 根据可用内存和请求数量动态调整 |
+| `max_seq_len` | 模型定义（如 128K） | 单个请求支持的最大序列长度 |
+| `prefill_chunk_size` | 可配置（如 2048） | Prefill 阶段单次处理的最大 token 数 |
+| KV Cache 槽位 | 按需分配 | 每个 token 需要 `2 * hidden_size * dtype_size` 字节 |
+
+### 5.2 性能优化关键点
+
+| 优化点 | 实现方式 | 效果 |
+|:---|:---|:---|
+| **前缀匹配优化** | Radix Tree 实现 O(k) 时间复杂度匹配 | 减少重复计算 |
+| **内存分配优化** | 批量分配 KV Cache 槽位 | 减少内存碎片 |
+| **数据传输优化** | 使用 `copy_done` Event 实现异步数据传输 | 隐藏传输延迟 |
+| **计算采样重叠** | 在 overlap 模式下，计算与采样可以重叠执行 | 提高 GPU 利用率 |
+
+---
+
+## 第六部分：关键算法与原理解释
+
+### 6.1 最长前缀匹配（Longest Prefix Matching）原理
+
+| 概念 | 解释 | 示例 |
+|:---|:---|:---|
+| **前缀匹配** | 在 Radix Tree 中查找与当前请求最长的公共前缀 | 请求 `ABC` 匹配缓存 `AFG` 的前缀 `A` |
+| **最大前缀原则** | 最多缓存到倒数第二个 token（`input_len - 1`） | 保留最后一个 token 作为本次推理的 input_ids |
+| **树节点拆分** | 将匹配节点拆分为公共前缀和剩余部分 | `AFG` 拆分为 `A`（公共）和 `FG`（剩余） |
+
+**为什么保留最后一个 Token？**
+> 模型需要一个输入 Token 来查询（Query）这些缓存的历史信息，并计算出当前步的 Logits（概率分布）。如果我们把所有 Token 都算作 Prefix 并从 Cache 中读取，那么当前步就没有"输入"喂给模型了，模型也就无法计算出 $t+1$ 的 Logits。因此，我们必须保留最后一个 Token 不放入 Prefix 匹配中，让它作为本次推理的 input_ids 输入给模型。
+
+### 6.2 Radix Tree 缓存管理
+
+| 操作 | 函数调用 | 作用 |
+|:---|:---|:---|
+| **前缀匹配** | `tree_cache.match_prefix()` | 查找最长公共前缀 |
+| **缓存保留** | `tree_cache.cache_unfinished_req()` | 保留未完成请求的缓存 |
+| **缓存释放** | `tree_cache.cache_finished_req()` | 释放已完成请求的缓存 |
+| **节点拆分** | Radix Tree 内部操作 | 将节点拆分为公共前缀和剩余部分 |
+
 
 ## Why Overlap?
 

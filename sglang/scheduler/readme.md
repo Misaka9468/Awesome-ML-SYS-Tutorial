@@ -186,9 +186,10 @@ Scheduler 在主循环中拿到 `GenerationBatchResult` 后，会根据它携带
 
 ### KV Cache Management
 
-Scheduling 本身涉及到 KV Cache 管理的部分不多，所以能够单独拎出来分析分析。非常有意思的是，在 SGLang 刚出的时候，由于 RadixCache 和 PagedAttention 的结合，SGLang 比起只用 PagedAttention 的 vLLM 而言，在 throughput 上有非常夸张的优势。彼时大概是 2024 年 8 月左右，也是我刚刚开始加入 SGLang 社区的时候。不过，那时候我心里有个固执的想法，我总是拿着 RadixCache 和 PagedAttention 做对标，认为这是同一个生态位的两种技术。甚至我当时还问过颖老板（Ying Sheng），结果她一直给我说这两个东西不矛盾。非常惭愧，从那之后，我也没有理解到二者的关系。虽然不理解也不妨碍我做 RL sys，到底还是心头一直好奇。这几天重新开始梳理 Scheduler，才想明白为什么 RadixCache 和 PagedAttention 是不矛盾的。到了 25 年初，RadixCache 和 PageAttention 这两项技术在 SGLang 和 vLLM 都是默认开启的，实现了类似操作系统中的“二级索引”。
+Scheduling 本身涉及到 KV Cache 管理的部分不多，所以能够单独拎出来分析分析。非常有意思的是，在 SGLang 刚出的时候，由于 RadixCache 和 PagedAttention 的结合，SGLang 比起只用 PagedAttention 的 vLLM 而言，在 throughput 上有非常夸张的优势。彼时大概是 2024 年 8 月左右，也是我刚刚开始加入 SGLang 社区的时候。不过，那时候我心里有个固执的想法，我总是拿着 RadixCache 和 PagedAttention 做对标，认为这是同一个生态位的两种技术。甚至我当时还问过颖老板（Ying Sheng），结果她一直给我说这两个东西不矛盾。非常惭愧，从那之后，我也没有理解到二者的关系。虽然不理解也不妨碍我做 RL sys，到底还是心头一直好奇。这几天重新开始梳理 Scheduler，才想明白为什么 RadixCache 和 PagedAttention 是不矛盾的。到了 25 年初，RadixCache 和 PageAttention 这两项技术在 SGLang 和 vLLM 都是默认开启的，实现了类似操作系统中的“多级索引”。
 
 实际上，Paged Attention 类似操作系统中的页表，解决了“逻辑缓存地址到物理存储地址”的映射问题；让逻辑上连续的 KV Cache 可以分布到物理上散乱的实际 VRAM 里，减少显存碎片；而 Radix Cache 则负责的是“缓存复用”的问题，前缀相同的 requests 能够复用一致的逻辑缓存地址，避免重复计算。
+
 
 | 维度 | Paged Attention (寻址层) | Radix Cache (策略层) |
 | :--- | :--- | :--- |
@@ -197,17 +198,62 @@ Scheduling 本身涉及到 KV Cache 管理的部分不多，所以能够单独�
 | 关注点 | 关注“怎么存”：如何利用不连续的显存块。 | 关注“存什么”：哪些前缀是一样的，可以复用。 |
 | 关系 | 没有分页，共享会因内存碎片而难以实施。 | 利用分页提供的灵活性，实现极致的复用。 |
 
-有了这些认知，我们通过三个 requests 的例子，来具体看看关键的数据结构 `req_to_token_pool` 和 `token_to_kv_pool`。
 
-假设系统正在处理以下三个共享部分前缀的请求：
+有了这些认知，我们举一个三个 requests 的例子，来看看关键的数据结构 `RadixCache`、`req_to_token_pool` 和 `token_to_kv_pool`。假设系统正在处理以下三个共享部分前缀的请求：
 
 ```python
-Request 1: ["A", "B", "C", "D"]
-Request 2: ["A", "B", "C", "F"]
-Request 3: ["A", "B", "G", "H"]
+
+# 假设系统在 Request 1 进入前，就已经处理了 "A, "B" 这个序列，对应的物理 Slot Indices 为 [10, 11]。
+
+- Request 1: ["A", "B", "C", "D"]
+- Request 2: ["A", "B", "C", "F"]
+- Request 3: ["A", "B", "G", "H"]
 ```
 
-首先，我们来看一级逻辑索引池 `req_to_token_pool`。它是一个二维矩阵，行索引是请求 ID，列索引是 token 的位置，存储的是每个 token 的 KV Cache 的实际物理地址（location）。
+请求会经过如下三层缓存以完成调度与计算：
+
+1. L1 Cache: RadixCache 逻辑层
+
+RadixCache 是整个调度的入口，它负责维护逻辑 Token 序列与物理地址之间的长效映射关系。当一个新 Request 进入 Scheduler 时，首先会进入到 RadixCache 来查找是否存在已有的前缀。如果命中，RadixCache 会返回这部分前缀对应的物理 Slot Indices。比如 Request 1 进入时，由于 “A,B” 在 RadixCache 中已经存在，因此会返回 [10, 11]。同时，RadixCache 会给这些 Slot 加锁（`lock_ref += 1`），防止这些 Slot 被回收。RadixCache 是一棵 Radix Tree，每个节点（TreeNode）记录了一段 Token 序列及其对应的物理 Slot Indices。每个 TreeNode 存在引用计数 (lock_ref)；只要有请求正在使用某一段前缀，该节点就被“锁定”，防止在物理层被回收。当显存不足时，RadixCache 负责决定释放哪些不再被引用的“冷前缀”。
+
+
+```python
+class TreeNode:
+    def __init__(self, token_ids, slot_indices):
+        # 逻辑标识：从根节点到当前节点的路径所代表的 Token 序列
+        self.key = token_ids       # 例如: ["A", "B", "C"]
+        
+        # 物理索引：从根节点到当前节点的路径所代表的 Token 序列在 token_to_kv_pool 中的物理 Slot Indices
+        self.value = slot_indices  # 例如: [10, 11, 12]
+        
+        # 引用计数：当前有多少个正在运行的请求在使用这个节点
+        self.lock_ref = 0          # lock_ref > 0 时，该节点及其物理槽位不可被驱逐
+        
+        # 树结构：子节点分支
+        self.children = {}
+        
+        # 驱逐策略元数据：LRU 时间戳
+        self.last_access_time = time.time()
+
+class RadixCache:
+    def match_prefix(self, token_ids):
+        # 1. 在树中搜索最长前缀
+        # 2. 命中后，增加该路径上所有节点的 lock_ref (锁定)
+        # 3. 返回物理 Slot Indices，供 ReqToTokenPool 拼凑“页表”
+        return matched_slot_indices
+
+    def evict(self, num_slots_to_free):
+        # 1. 扫描树中所有 lock_ref == 0 的叶子节点
+        # 2. 按照 last_access_time 从旧到新排序 (LRU)
+        # 3. 释放物理槽位并删除节点，直到凑齐足够的显存空间
+        pass
+```
+
+2. L2 Cache: ReqToTokenPool 寻址层
+
+`ReqToTokenPool` 是一个二维矩阵，行索引是请求 ID，列索引是 token 的位置，存储的是每个 token 的 KV Cache 的实际物理地址（location）。
+
+Request 经过 RadixCache 后，会得到对应的物理 Slot Indices。接着，Scheduler 就会将这些物理 Slot Indices 写入到 `req_to_token_pool` 中该请求对应的行里。此外，对于私有部分，也即 Request 中 RadixCache 中没有命中的那部分 tokens，Scheduler 会申请新的物理 Slot，写入到 `req_to_token_pool` 中该该行的后续位置。还是以 Request 1 为例，在 radix cache 中，request 1 为 `"A, B"` 查询到的物理 Slot Indices 为 [10, 11]，而为私有的 `"C, D"` 申请到的物理 Slot Indices 为 `[12, 20]`。因此，`req_to_token_pool` 中 Request 1 对应的行就是 `[10, 11, 12. 20]`。
 
 | 请求标识 (`req_pool_idx`) | Pos 0 | Pos 1 | Pos 2 | Pos 3 | 说明 (Radix Cache 决策结果) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -215,10 +261,33 @@ Request 3: ["A", "B", "G", "H"]
 | **Request 2 (R2)** | **10** | **11** | **12** | **25** | 共享 ABC，私有 F |
 | **Request 3 (R3)** | **10** | **11** | **40** | **41** | 共享 AB，私有 GH |
 
-接着，我们来看二级物理索引 `token_to_kv_pool`，这是 GPU 显存中真正存放 KV Tensor 的地方。由于 Paged Attention 的存在，物理槽位完全不需要连续。
+实际上 `req_to_token_pool` 中的大小是 `[request_num, max_context_len]`：
+
+```python
+class ReqToTokenPool:
+    def __init__(self, size: int, max_context_len: int, device: str, enable_memory_saver: bool):
+        # 主要存储结构：[请求数量, 最大上下文长度]
+        self.req_to_token = torch.zeros(
+            (size, max_context_len),
+            dtype=torch.int32,
+            device=device
+        )
+        self.free_slots = list(range(size))  # 可用槽位列表
+        self.size = size
+        self.max_context_len = max_context_len
+```
+
+注意，当 GPU 完成了私有部分的 KV Cache 计算后，Scheduler 会调用 `radix_cache.insert()`，将这些 Request 私有的 Slot（如 R1 的 `[12, 20]`）及其对应的 Token（如 `[C, D]`）回填到树中。这样，原本属于 R1 私有的节点就变成了可共享的资源，使得后续的 Request 2 能够直接命中 `"A, B, C"` 前缀。
+
+3. L3 Cache: TokenToKVPool 物理层
+
+最后，我们来看三级物理索引 `token_to_kv_pool`，这是 GPU 显存中真正存放 KV Tensor 的地方。
+
+经过了 L1 与 L2 cache 的逻辑与物理映射后，新 Request 的 KV Cache 完成了查找与分配。Scheduler 将这些 Requests 组成 batch，进入真正的 Forward 阶段。模型 forward 的过程中，GPU 算子会去 `req_to_token_pool` 里读取当前 batch 内每个 request 对应的物理 Slot Indices，接着在 `token_to_kv_pool` 中拿到对应的 KV Tensor。注意到，由于 Paged Attention 的存在，物理槽位完全不需要连续。以 Request 1 为例，在模型 Forward 时，GPU 算子只需要通过 `req_to_token_pool` 拿到物理索引序列 `[10, 11, 12, 20]`，接着在 `token_to_kv_pool` 中拿到对应的 KV Tensor。即使这些数字在物理上跨度极大（中间有大量空格或其他请求的数据），映射表也能把它们在逻辑上“缝合”成一个连续的 Tensor。
 
 | 物理槽位 (Slot Index) | ... | **10** | **11** | **12** | ... | **20** | ... | **25** | ... | **40** | **41** | ... |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **KV 数据内容** | 其他 token | **[A]** | **[B]** | **[C]** | 其他 token | **[D]** | 其他 token | **[F]** | 其他 token | **[G]** | **[H]** | 其他 token |
 | **共享状态 (策略层)** | 未知 | R1 R2 R3 共享 | R1 R2 R3 共享 | R1 R2 共享 | 未知 | R1 私有 | 未知 | R2 私有 | 未知 | R3 私有 | R3 私有 | 未知 |
+
 

@@ -98,7 +98,7 @@ class ProfileReqInput(BaseReq):
 
 2. /end_profile 相关
 
-手动停止server的profile，如果在start_profile中已经设定了num_steps, server将在完成设定stepd的profile会停止.
+手动停止server的profile，如果在start_profile中已经设定了num_steps, server将在完成设定steps的profile会停止.
 
 ```bash
 curl -X POST http://127.0.0.1:30000/end_profile

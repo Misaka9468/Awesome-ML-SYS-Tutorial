@@ -149,7 +149,7 @@ nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node \
 # client
 python3 -m sglang.bench_serving --backend sglang \
     --num-prompts 1000 --dataset-name random \
-    --random-input 1024 --random-output 512
+    --random-input 1024 --random-output 512
 ```
 
 其中,

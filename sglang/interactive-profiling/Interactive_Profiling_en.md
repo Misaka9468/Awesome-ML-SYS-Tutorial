@@ -211,7 +211,7 @@ After capturing traces from multiple ranks, how can we conveniently observe and 
 
 Currently, one answer is: Whether using Perfetto or Nsight Systems, you can pin the key rows (pin row). Afterward, you can conveniently compare them while zooming in and out of the entire visualization graph. Of course, if there are better methods, corrections and suggestions are welcome.
 
-## Reference
+## References
 
 https://github.com/sgl-project/sglang/issues/9638
 
